@@ -47,11 +47,10 @@
 #define TEXT_COL          RGB(255, 255, 255)
 #define DIM_COL           RGB(200, 200, 200)
 #define BAR_COL           RGB(216, 216, 216)
-#define SHADOW            1       /* drop shadow so text is readable on light wallpapers */
-#define SHADOW_COL        RGB(0, 0, 0)
+#define SHADOW            1       /* soft shadow so text is readable on light wallpapers */
+#define SHADOW_ALPHA      150     /* shadow strength, 0-255 */
 #define CLICK_THROUGH     1       /* mouse clicks pass through to the desktop */
 #define PAUSE_WHEN_HIDDEN 1       /* stop collecting/drawing during fullscreen apps or when locked */
-#define KEY_COL           RGB(1, 1, 1) /* becomes fully transparent - don't use it elsewhere */
 #define ICON_COL          0xFF3FC1C9u  /* tray icon bars (ARGB) - teal reads on light and dark taskbars */
 /* --------------------------------------------------------------------------- */
 
@@ -160,12 +159,14 @@ static int panel_visible = 1;       /* saved */
 static double S;
 static int W, H, LH, SH, GAP, INSET;
 static HFONT font, font_bold;
-static HPEN pen_dim, pen_shadow;
-static HBRUSH br_bar, br_key;
+static HPEN pen_dim;
+static HBRUSH br_bar;
 static HDC g_dc;
 static int Y;
-static HDC memdc;
+static HDC memdc;                   /* 32-bit frame buffer with per-pixel alpha */
 static HBITMAP membmp;
+static DWORD *bits;
+static BYTE *abuf, *sbuf;           /* text coverage and shadow masks */
 static int mem_w, mem_h;
 static HWND g_hwnd;                 /* the panel */
 
@@ -481,10 +482,6 @@ static void text_at(int x, const WCHAR *s, COLORREF c, UINT align)
     int n = (int)wcslen(s);
     if (!n) return;
     SetTextAlign(g_dc, align | TA_TOP | TA_NOUPDATECP);
-    if (SHADOW) {
-        SetTextColor(g_dc, SHADOW_COL);
-        TextOutW(g_dc, x + SH, Y + SH, s, n);
-    }
     SetTextColor(g_dc, c);
     TextOutW(g_dc, x, Y, s, n);
 }
@@ -505,7 +502,6 @@ static void header(const WCHAR *t)
     GetTextExtentPoint32W(g_dc, t, (int)wcslen(t), &sz);
     SelectObject(g_dc, font);
     int mid = Y + LH / 2, x0 = sz.cx + (int)(8 * S);
-    if (SHADOW) hline(pen_shadow, x0 + SH, W - 2 + SH, mid + SH);
     hline(pen_dim, x0, W - 2, mid);
     Y += LH;
 }
@@ -522,10 +518,6 @@ static void bar_row(const WCHAR *label, double pct)
     text_at(0, label, TEXT_COL, TA_LEFT);
     int x0 = (int)(W * 0.55), x1 = W - 2, y0 = Y + INSET, y1 = Y + LH - INSET;
     SelectObject(g_dc, GetStockObject(NULL_BRUSH));
-    if (SHADOW) {
-        SelectObject(g_dc, pen_shadow);
-        Rectangle(g_dc, x0 + SH, y0 + SH, x1 + SH, y1 + SH);
-    }
     SelectObject(g_dc, pen_dim);
     Rectangle(g_dc, x0, y0, x1, y1);
     if (pct < 0) pct = 0;
@@ -674,6 +666,86 @@ static int measure_height(void)
     return h;
 }
 
+/*
+ * Draw a frame with real per-pixel transparency.
+ * Everything is drawn in white/grey onto black, so each pixel's brightness is
+ * how much of it is covered by text - that becomes its alpha. Anti-aliased
+ * edges therefore fade into the wallpaper instead of into a near-black key
+ * colour (which is what caused the dark halo). The shadow is the same coverage
+ * mask, offset and blurred, composited underneath.
+ */
+static void present(void)
+{
+    if (!panel_visible || W <= 0 || H <= 0) return;
+
+    if (!memdc || mem_w != W || mem_h != H) {
+        if (memdc) { DeleteDC(memdc); DeleteObject(membmp); free(abuf); free(sbuf); }
+        BITMAPINFO bi;
+        memset(&bi, 0, sizeof bi);
+        bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bi.bmiHeader.biWidth = W;
+        bi.bmiHeader.biHeight = -H; /* top-down */
+        bi.bmiHeader.biPlanes = 1;
+        bi.bmiHeader.biBitCount = 32;
+        bi.bmiHeader.biCompression = BI_RGB;
+        memdc = CreateCompatibleDC(NULL);
+        membmp = CreateDIBSection(memdc, &bi, DIB_RGB_COLORS, (void **)&bits, NULL, 0);
+        abuf = (BYTE *)malloc((size_t)W * H);
+        sbuf = (BYTE *)malloc((size_t)W * H);
+        if (!membmp || !bits || !abuf || !sbuf) { DeleteDC(memdc); memdc = NULL; return; }
+        SelectObject(memdc, membmp);
+        mem_w = W; mem_h = H;
+    }
+
+    memset(bits, 0, (size_t)W * H * 4);
+    render(memdc);
+    GdiFlush();
+
+    int n = W * H;
+    for (int i = 0; i < n; i++) {
+        DWORD p = bits[i];
+        BYTE r = (BYTE)(p >> 16), g = (BYTE)(p >> 8), b = (BYTE)p;
+        BYTE a = r > g ? r : g;
+        abuf[i] = a > b ? a : b;
+    }
+
+    if (SHADOW) {
+        /* coverage shifted by SH, 3x3 box blur, scaled to SHADOW_ALPHA */
+        for (int y = 0; y < H; y++) {
+            for (int x = 0; x < W; x++) {
+                int sum = 0;
+                for (int dy = -1; dy <= 1; dy++) {
+                    int sy = y - SH + dy;
+                    if (sy < 0 || sy >= H) continue;
+                    for (int dx = -1; dx <= 1; dx++) {
+                        int sx = x - SH + dx;
+                        if (sx >= 0 && sx < W) sum += abuf[sy * W + sx];
+                    }
+                }
+                sbuf[y * W + x] = (BYTE)(sum * SHADOW_ALPHA / (9 * 255));
+            }
+        }
+    }
+
+    for (int i = 0; i < n; i++) {
+        int a = abuf[i], s = SHADOW ? sbuf[i] : 0;
+        int ao = a + s * (255 - a) / 255; /* text over black shadow; colour already premultiplied */
+        bits[i] = ((DWORD)ao << 24) | (bits[i] & 0x00FFFFFF);
+    }
+
+    POINT src = { 0, 0 };
+    SIZE sz = { W, H };
+    BLENDFUNCTION bf = { AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+    UpdateLayeredWindow(g_hwnd, NULL, NULL, &sz, memdc, &src, 0, &bf, ULW_ALPHA);
+
+#ifdef DESKMON_TEST
+    { /* test builds: dump the final premultiplied BGRA frame */
+        FILE *f = fopen("panel.raw", "wb");
+        if (f) { fwrite(&W, 4, 1, f); fwrite(&H, 4, 1, f); fwrite(bits, 4, (size_t)n, f); fclose(f); }
+    }
+#endif
+}
+
 static void place_window(void)
 {
     int x = GetSystemMetrics(SM_CXSCREEN) - W - (int)(MARGIN_X * S / SCALE);
@@ -688,7 +760,7 @@ static void relayout(void)
     collect();
     H = measure_height();
     place_window();
-    InvalidateRect(g_hwnd, NULL, FALSE);
+    present();
 }
 
 static void tray_tip(void)
@@ -720,7 +792,7 @@ static void tick(HWND hwnd)
     }
     collect();
     tray_tip();
-    InvalidateRect(hwnd, NULL, FALSE);
+    present();
     SetWindowPos(hwnd, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE);
     SetTimer(hwnd, 1, next_delay(), NULL);
 }
@@ -746,24 +818,6 @@ static LRESULT CALLBACK panelproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     case WM_ERASEBKGND:
         return 1;
-    case WM_PAINT: {
-        PAINTSTRUCT ps;
-        HDC hdc = BeginPaint(hwnd, &ps);
-        RECT rc;
-        GetClientRect(hwnd, &rc);
-        if (!memdc || mem_w != rc.right || mem_h != rc.bottom) {
-            if (memdc) { DeleteDC(memdc); DeleteObject(membmp); }
-            memdc = CreateCompatibleDC(hdc);
-            membmp = CreateCompatibleBitmap(hdc, rc.right, rc.bottom);
-            SelectObject(memdc, membmp);
-            mem_w = rc.right; mem_h = rc.bottom;
-        }
-        FillRect(memdc, &rc, br_key);
-        render(memdc);
-        BitBlt(hdc, 0, 0, rc.right, rc.bottom, memdc, 0, 0, SRCCOPY);
-        EndPaint(hwnd, &ps);
-        return 0;
-    }
     case WM_WINDOWPOSCHANGING: {
         WINDOWPOS *wpos = (WINDOWPOS *)lp;
         if (!(wpos->flags & SWP_NOZORDER)) wpos->hwndInsertAfter = HWND_BOTTOM;
@@ -963,9 +1017,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
     ReleaseDC(NULL, sdc);
     LH = tm.tmHeight + (int)(2 * S + 0.5);
     pen_dim = CreatePen(PS_SOLID, SH, DIM_COL);
-    pen_shadow = CreatePen(PS_SOLID, SH, SHADOW_COL);
     br_bar = CreateSolidBrush(BAR_COL);
-    br_key = CreateSolidBrush(KEY_COL);
 
     /* first sample primes the CPU counters; then measure the layout height */
     collect();
@@ -991,7 +1043,6 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
                              0, 0, 0, 0, NULL, NULL, inst, NULL);
     if (!g_hwnd || !g_tray) return 1;
 
-    SetLayeredWindowAttributes(g_hwnd, KEY_COL, 0, LWA_COLORKEY);
     RegisterHotKey(g_hwnd, 1, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'Q');
 
     WM_TASKBARCREATED = RegisterWindowMessageW(L"TaskbarCreated");
@@ -999,7 +1050,10 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
     tray_add();
 
     place_window();
-    if (panel_visible) ShowWindow(g_hwnd, SW_SHOWNOACTIVATE);
+    if (panel_visible) {
+        present(); /* a layered window needs its first frame before it's shown */
+        ShowWindow(g_hwnd, SW_SHOWNOACTIVATE);
+    }
     SetTimer(g_hwnd, 1, next_delay(), NULL);
 
     MSG m;
